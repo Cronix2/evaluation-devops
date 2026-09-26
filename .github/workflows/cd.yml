@@ -1,4 +1,4 @@
-name: CD
+﻿name: CD
 
 on:
   workflow_run:
@@ -155,12 +155,26 @@ jobs:
 
           $stateFile = Join-Path $stateDir "previous-image.txt"
 
-          $currentImage = docker inspect `
-            evaluation-devops-production `
-            --format '{{.Config.Image}}' `
-            2>$null
+          # Le premier deploiement n'a pas encore de conteneur precedent.
+          # On verifie donc son existence AVANT d'appeler docker inspect.
+          $existingContainer = docker ps -a `
+            --filter "name=^/evaluation-devops-production$" `
+            --format "{{.Names}}"
 
-          if ($LASTEXITCODE -eq 0 -and $currentImage) {
+          if ($existingContainer -eq "evaluation-devops-production") {
+
+            $currentImage = docker inspect `
+              evaluation-devops-production `
+              --format '{{.Config.Image}}'
+
+          }
+          else {
+
+            $currentImage = $null
+
+          }
+
+          if ($currentImage) {
               Set-Content `
                 -Path $stateFile `
                 -Value $currentImage `
