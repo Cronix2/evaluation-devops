@@ -1,0 +1,203 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+
+  # ==========================================================
+  # LINT
+  # ==========================================================
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Flake8
+        run: |
+          python -m flake8 app tests
+
+
+  # ==========================================================
+  # TESTS - MATRIX PYTHON 3.11 / 3.12 + REDIS
+  # ==========================================================
+
+  test:
+    name: Test Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.11"
+          - "3.12"
+
+    services:
+      redis:
+        image: redis:7.4.1-alpine
+
+        ports:
+          - 6379:6379
+
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
+    env:
+      REDIS_HOST: localhost
+      REDIS_PORT: "6379"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Check Redis
+        run: |
+          python -c "import redis; r=redis.Redis(host='localhost', port=6379); assert r.ping(); print('Redis OK')"
+
+      - name: Run tests with coverage
+        run: |
+          python -m pytest \
+            --cov=app \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage.xml \
+            --junitxml=junit-${{ matrix.python-version }}.xml \
+            tests
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports-python-${{ matrix.python-version }}
+          path: |
+            coverage.xml
+            junit-${{ matrix.python-version }}.xml
+          if-no-files-found: error
+          retention-days: 7
+
+
+  # ==========================================================
+  # BUILD DOCKER
+  # ==========================================================
+
+  build:
+    name: Build Docker image
+    runs-on: ubuntu-latest
+
+    needs:
+      - lint
+      - test
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: evaluation-devops:ci
+          build-args: |
+            APP_VERSION=ci
+            COMMIT_SHA=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Inspect Docker image
+        run: |
+          docker image inspect evaluation-devops:ci
+          docker image ls evaluation-devops:ci
+
+      - name: Save Docker image
+        run: |
+          docker save evaluation-devops:ci | gzip > evaluation-devops-image.tar.gz
+
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: evaluation-devops-docker-image
+          path: evaluation-devops-image.tar.gz
+          retention-days: 7
+
+
+  # ==========================================================
+  # CI OK
+  # ==========================================================
+
+  ci-ok:
+    name: CI OK
+    runs-on: ubuntu-latest
+
+    if: always()
+
+    needs:
+      - lint
+      - test
+      - build
+
+    steps:
+      - name: Check required jobs
+        env:
+          LINT_RESULT: ${{ needs.lint.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+        run: |
+          echo "Lint  : $LINT_RESULT"
+          echo "Tests : $TEST_RESULT"
+          echo "Build : $BUILD_RESULT"
+
+          if [ "$LINT_RESULT" != "success" ]; then
+            exit 1
+          fi
+
+          if [ "$TEST_RESULT" != "success" ]; then
+            exit 1
+          fi
+
+          if [ "$BUILD_RESULT" != "success" ]; then
+            exit 1
+          fi
+
+          echo "CI complete : all required jobs succeeded."
