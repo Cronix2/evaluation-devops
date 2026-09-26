@@ -1,4 +1,4 @@
-﻿name: CD
+name: CD
 
 on:
   workflow_run:
@@ -194,7 +194,13 @@ jobs:
       - name: Start Redis
         shell: powershell
         run: |
-          docker rm -f evaluation-devops-redis 2>$null
+          $redisContainer = docker ps -a `
+            --filter "name=^/evaluation-devops-redis$" `
+            --format "{{.Names}}"
+
+          if ($redisContainer -eq "evaluation-devops-redis") {
+            docker rm -f evaluation-devops-redis
+          }
 
           docker network inspect evaluation-devops-production-net 2>$null
 
@@ -212,7 +218,13 @@ jobs:
       - name: Deploy new application
         shell: powershell
         run: |
-          docker rm -f evaluation-devops-production 2>$null
+          $appContainer = docker ps -a `
+            --filter "name=^/evaluation-devops-production$" `
+            --format "{{.Names}}"
+
+          if ($appContainer -eq "evaluation-devops-production") {
+            docker rm -f evaluation-devops-production
+          }
 
           docker run `
             -d `
@@ -274,7 +286,13 @@ jobs:
             $env:USERPROFILE `
             "evaluation-devops-deploy\previous-image.txt"
 
-          docker rm -f evaluation-devops-production 2>$null
+          $appContainer = docker ps -a `
+            --filter "name=^/evaluation-devops-production$" `
+            --format "{{.Names}}"
+
+          if ($appContainer -eq "evaluation-devops-production") {
+            docker rm -f evaluation-devops-production
+          }
 
           if (Test-Path $stateFile) {
 
