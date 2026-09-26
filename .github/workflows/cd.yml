@@ -1,0 +1,138 @@
+name: CD
+
+on:
+  workflow_run:
+    workflows:
+      - CI
+    types:
+      - completed
+    branches:
+      - main
+
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Deployment environment"
+        required: true
+        default: "production"
+        type: choice
+        options:
+          - production
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  VERSION: "1.0.0"
+
+jobs:
+
+  # ==========================================================
+  # PUBLICATION GHCR
+  # ==========================================================
+
+  publish:
+    name: Publish image to GHCR
+
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' ||
+        (
+          github.event_name == 'workflow_run' &&
+          github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.head_branch == 'main'
+        )
+      }}
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    permissions:
+      contents: read
+      packages: write
+
+    outputs:
+      short_sha: ${{ steps.vars.outputs.short_sha }}
+      image: ${{ steps.vars.outputs.image }}
+
+    steps:
+
+      - name: Checkout repository after CI
+        if: github.event_name == 'workflow_run'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Checkout repository for manual run
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@v4
+
+      - name: Compute image metadata
+        id: vars
+        shell: bash
+        run: |
+          SHORT_SHA="$(git rev-parse --short=7 HEAD)"
+          IMAGE="$(echo "${REGISTRY}/${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')"
+
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+
+          echo "Image     : ${IMAGE}"
+          echo "SHA court : ${SHORT_SHA}"
+          echo "Version   : ${VERSION}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR with GITHUB_TOKEN
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+
+          tags: |
+            ${{ steps.vars.outputs.image }}:latest
+            ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.short_sha }}
+            ${{ steps.vars.outputs.image }}:${{ env.VERSION }}
+
+          build-args: |
+            APP_VERSION=${{ env.VERSION }}
+            COMMIT_SHA=${{ steps.vars.outputs.short_sha }}
+
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify published tags
+        shell: bash
+        run: |
+          docker buildx imagetools inspect \
+            "${{ steps.vars.outputs.image }}:latest"
+
+          docker buildx imagetools inspect \
+            "${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.short_sha }}"
+
+          docker buildx imagetools inspect \
+            "${{ steps.vars.outputs.image }}:${VERSION}"
+
+      - name: Publication summary
+        shell: bash
+        run: |
+          {
+            echo "## GHCR publication"
+            echo
+            echo '```text'
+            echo "${{ steps.vars.outputs.image }}:latest"
+            echo "${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.short_sha }}"
+            echo "${{ steps.vars.outputs.image }}:${VERSION}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
