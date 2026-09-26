@@ -1,0 +1,31 @@
+groups:
+  - name: evaluation-devops-alerts
+    rules:
+      - alert: HighHttp5xxErrorRate
+        expr: |
+          (
+            sum(rate(http_requests_total{code=~"5.."}[5m]))
+            /
+            clamp_min(sum(rate(http_requests_total[5m])), 0.000001)
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Taux d'erreurs HTTP 5xx eleve"
+          description: "Plus de 5 % des requetes HTTP retournent une erreur 5xx depuis au moins 5 minutes."
+
+      - alert: HighHttpRequestLatencyP95
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le, route) (
+              rate(http_request_duration_seconds_bucket[5m])
+            )
+          ) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Latence HTTP p95 elevee"
+          description: "Le p95 de latence d'au moins une route depasse 500 ms depuis au moins 10 minutes."
