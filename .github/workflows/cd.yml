@@ -202,10 +202,12 @@ jobs:
             docker rm -f evaluation-devops-redis
           }
 
-          docker network inspect evaluation-devops-production-net 2>$null
+          $productionNetwork = docker network ls `
+            --filter "name=^evaluation-devops-production-net$" `
+            --format "{{.Name}}"
 
-          if ($LASTEXITCODE -ne 0) {
-              docker network create evaluation-devops-production-net
+          if ($productionNetwork -ne "evaluation-devops-production-net") {
+            docker network create evaluation-devops-production-net
           }
 
           docker run `
