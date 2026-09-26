@@ -30,10 +30,6 @@ env:
 
 jobs:
 
-  # ==========================================================
-  # PUBLICATION GHCR
-  # ==========================================================
-
   publish:
     name: Publish image to GHCR
 
@@ -60,13 +56,13 @@ jobs:
 
     steps:
 
-      - name: Checkout repository after CI
+      - name: Checkout after CI
         if: github.event_name == 'workflow_run'
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
 
-      - name: Checkout repository for manual run
+      - name: Checkout manual run
         if: github.event_name == 'workflow_dispatch'
         uses: actions/checkout@v4
 
@@ -80,59 +76,244 @@ jobs:
           echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
           echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
 
-          echo "Image     : ${IMAGE}"
-          echo "SHA court : ${SHORT_SHA}"
-          echo "Version   : ${VERSION}"
+          echo "Image: ${IMAGE}"
+          echo "SHA: ${SHORT_SHA}"
+          echo "Version: ${VERSION}"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to GHCR with GITHUB_TOKEN
+      - name: Login to GHCR
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push image
+      - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-
           tags: |
             ${{ steps.vars.outputs.image }}:latest
             ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.short_sha }}
             ${{ steps.vars.outputs.image }}:${{ env.VERSION }}
-
           build-args: |
             APP_VERSION=${{ env.VERSION }}
             COMMIT_SHA=${{ steps.vars.outputs.short_sha }}
-
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Verify published tags
+      - name: Verify images
         shell: bash
         run: |
-          docker buildx imagetools inspect \
-            "${{ steps.vars.outputs.image }}:latest"
+          docker buildx imagetools inspect "${{ steps.vars.outputs.image }}:latest"
+          docker buildx imagetools inspect "${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.short_sha }}"
+          docker buildx imagetools inspect "${{ steps.vars.outputs.image }}:${VERSION}"
 
-          docker buildx imagetools inspect \
-            "${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.short_sha }}"
 
-          docker buildx imagetools inspect \
-            "${{ steps.vars.outputs.image }}:${VERSION}"
+  deploy:
+    name: Deploy production
 
-      - name: Publication summary
-        shell: bash
+    needs:
+      - publish
+
+    runs-on:
+      - self-hosted
+      - Windows
+      - production
+      - docker
+
+    timeout-minutes: 15
+
+    permissions:
+      contents: read
+      packages: read
+
+    env:
+      IMAGE: ${{ needs.publish.outputs.image }}
+      NEW_SHA: ${{ needs.publish.outputs.short_sha }}
+
+    steps:
+
+      - name: Login to GHCR
+        shell: powershell
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          {
-            echo "## GHCR publication"
-            echo
-            echo '```text'
-            echo "${{ steps.vars.outputs.image }}:latest"
-            echo "${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.short_sha }}"
-            echo "${{ steps.vars.outputs.image }}:${VERSION}"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          $env:GHCR_TOKEN | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Pull new image
+        shell: powershell
+        run: |
+          docker pull "${env:IMAGE}:${env:NEW_SHA}"
+
+      - name: Save previous deployment
+        shell: powershell
+        run: |
+          $stateDir = Join-Path $env:USERPROFILE "evaluation-devops-deploy"
+
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path $stateDir | Out-Null
+
+          $stateFile = Join-Path $stateDir "previous-image.txt"
+
+          $currentImage = docker inspect `
+            evaluation-devops-production `
+            --format '{{.Config.Image}}' `
+            2>$null
+
+          if ($LASTEXITCODE -eq 0 -and $currentImage) {
+              Set-Content `
+                -Path $stateFile `
+                -Value $currentImage `
+                -NoNewline
+
+              Write-Host "Previous image: $currentImage"
+          }
+          else {
+              Remove-Item `
+                $stateFile `
+                -Force `
+                -ErrorAction SilentlyContinue
+
+              Write-Host "No previous deployment."
+          }
+
+      - name: Start Redis
+        shell: powershell
+        run: |
+          docker rm -f evaluation-devops-redis 2>$null
+
+          docker network inspect evaluation-devops-production-net 2>$null
+
+          if ($LASTEXITCODE -ne 0) {
+              docker network create evaluation-devops-production-net
+          }
+
+          docker run `
+            -d `
+            --name evaluation-devops-redis `
+            --network evaluation-devops-production-net `
+            --restart unless-stopped `
+            redis:7.4.1-alpine
+
+      - name: Deploy new application
+        shell: powershell
+        run: |
+          docker rm -f evaluation-devops-production 2>$null
+
+          docker run `
+            -d `
+            --name evaluation-devops-production `
+            --network evaluation-devops-production-net `
+            --restart unless-stopped `
+            -p 5050:5000 `
+            -e REDIS_HOST=evaluation-devops-redis `
+            -e REDIS_PORT=6379 `
+            "${env:IMAGE}:${env:NEW_SHA}"
+
+      - name: Healthcheck with 3 retries
+        id: health
+        shell: powershell
+        continue-on-error: true
+        run: |
+          $healthy = $false
+
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+
+              Write-Host "Healthcheck attempt $attempt/3"
+
+              try {
+                  $response = Invoke-WebRequest `
+                      -Uri "http://127.0.0.1:5050/health" `
+                      -UseBasicParsing `
+                      -TimeoutSec 10
+
+                  Write-Host $response.Content
+
+                  if ($response.StatusCode -eq 200) {
+                      $healthy = $true
+                      break
+                  }
+              }
+              catch {
+                  Write-Host "Healthcheck failed: $($_.Exception.Message)"
+              }
+
+              if ($attempt -lt 3) {
+                  Start-Sleep -Seconds 5
+              }
+          }
+
+          if (-not $healthy) {
+              Write-Error "Application unhealthy after 3 attempts."
+              exit 1
+          }
+
+          Write-Host "Application is healthy."
+
+      - name: Rollback if healthcheck failed
+        if: steps.health.outcome == 'failure'
+        shell: powershell
+        run: |
+          Write-Host "DEPLOYMENT FAILED - STARTING ROLLBACK"
+
+          $stateFile = Join-Path `
+            $env:USERPROFILE `
+            "evaluation-devops-deploy\previous-image.txt"
+
+          docker rm -f evaluation-devops-production 2>$null
+
+          if (Test-Path $stateFile) {
+
+              $previousImage = Get-Content $stateFile -Raw
+              $previousImage = $previousImage.Trim()
+
+              Write-Host "Rollback image: $previousImage"
+
+              docker pull $previousImage
+
+              docker run `
+                -d `
+                --name evaluation-devops-production `
+                --network evaluation-devops-production-net `
+                --restart unless-stopped `
+                -p 5050:5000 `
+                -e REDIS_HOST=evaluation-devops-redis `
+                -e REDIS_PORT=6379 `
+                $previousImage
+
+              Start-Sleep -Seconds 5
+
+              Invoke-WebRequest `
+                -Uri "http://127.0.0.1:5050/health" `
+                -UseBasicParsing `
+                -TimeoutSec 10
+
+              Write-Host "Rollback completed."
+          }
+          else {
+              Write-Error "No previous image available for rollback."
+          }
+
+          exit 1
+
+      - name: Validate deployment
+        if: steps.health.outcome == 'success'
+        shell: powershell
+        run: |
+          Write-Host "Deployment successful."
+          Write-Host "Image: ${env:IMAGE}:${env:NEW_SHA}"
+
+          docker ps `
+            --filter "name=evaluation-devops-production" `
+            --filter "name=evaluation-devops-redis"
+
+          $response = Invoke-RestMethod `
+            -Uri "http://127.0.0.1:5050/health"
+
+          $response | ConvertTo-Json -Depth 10
