@@ -1,0 +1,58 @@
+﻿services:
+
+  redis:
+    image: redis:7.4.1-alpine
+    restart: unless-stopped
+
+    healthcheck:
+      test:
+        - CMD
+        - redis-cli
+        - ping
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+    volumes:
+      - redis-data:/data
+
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_VERSION: "1.0.0"
+        COMMIT_SHA: "local"
+
+    image: evaluation-devops:local
+
+    restart: unless-stopped
+
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      APP_VERSION: "1.0.0"
+      COMMIT_SHA: "local"
+
+    ports:
+      - "5000:5000"
+
+    depends_on:
+      redis:
+        condition: service_healthy
+
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - --fail
+        - http://localhost:5000/health
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+
+volumes:
+  redis-data:
